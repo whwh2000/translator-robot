@@ -1,6 +1,6 @@
 import streamlit as st
 from google import genai
-from google.genai import types # Added for more stable audio processing
+from google.genai import types 
 from gtts import gTTS
 import io
 import re
@@ -26,14 +26,22 @@ LANG_MAP = {
 if "prev_lang" not in st.session_state:
     st.session_state.prev_lang = "Korean"
 
-# --- 3. AUDIO HELPER (Mobile Fix) ---
+# --- 3. AUDIO HELPER (Mobile Stability + Label Scrubbing) ---
 def get_audio_html(text, lang_name):
     lang_code = LANG_MAP.get(lang_name, "en")
+    
+    # 1. Remove phonetic guides in brackets
     clean_text = re.sub(r'\(.*?\)', '', text)
-    patterns = [r'^Formal\s*:\s*', r'^Informal\s*:\s*', r'^Reply\s*\d+\s*:\s*', r'^Translation\s*:\s*', r'^\d+\.\s*']
+    
+    # 2. Scrub labels so the voice doesn't read "Formal:" or "Reply 1:"
+    patterns = [
+        r'^Formal\s*:\s*', r'^Informal\s*:\s*', 
+        r'^Reply\s*\d+\s*:\s*', r'^Translation\s*:\s*', r'^\d+\.\s*'
+    ]
     for p in patterns:
         clean_text = re.sub(p, '', clean_text, flags=re.IGNORECASE)
 
+    # 3. Filter for native script in specific languages
     if lang_name in ["Korean", "Japanese", "Russian", "Ukrainian"]:
         chars = re.findall(r'[\u3040-\u30FF\u4E00-\u9FAF\uAC00-\uD7AF\u0400-\u04FF0-9?.!, ]+', clean_text)
         clean_text = "".join(chars)
@@ -46,11 +54,13 @@ def get_audio_html(text, lang_name):
         fp = io.BytesIO()
         tts.write_to_fp(fp)
         fp.seek(0)
+        
+        # Base64 encoding lets mobile browsers play audio without server fetching
         b64 = base64.b64encode(fp.read()).decode()
         return f'<audio controls src="data:audio/mp3;base64,{b64}" style="width: 100%; height: 35px;"></audio>'
     except Exception: return None
 
-# --- 4. CALLBACK FOR CLEARING ---
+# --- 4. CALLBACK FOR CLEARING (Safe Reset) ---
 def on_clear_click():
     st.session_state.main_input_field = ""
     for key in ["current_translation", "user_translation", "last_input", "recorder"]:
@@ -61,10 +71,13 @@ def on_clear_click():
 with st.sidebar:
     st.header("Robot Settings")
     target_lang = st.selectbox("Pick a Language:", list(LANG_MAP.keys()))
+    
+    # Reset if language changes
     if target_lang != st.session_state.prev_lang:
         st.session_state.prev_lang = target_lang
         on_clear_click()
         st.rerun()
+        
     mode = st.radio("Choose Mode:", ["Live Translation", "Practice Chat"])
     st.divider()
     if st.button("Deep Cache Clear"):
@@ -74,7 +87,7 @@ with st.sidebar:
 # --- 6. MAIN INTERFACE ---
 st.title(f"🤖 Magic {target_lang} Robot")
 
-# Container for Voice
+# VOICE INPUT
 st.write("🎙️ Step 1: Speak to the robot")
 audio_info = mic_recorder(
     start_prompt="Start Recording",
@@ -82,7 +95,7 @@ audio_info = mic_recorder(
     key='recorder'
 )
 
-# Container for Text
+# TEXT INPUT
 st.write("---")
 st.write("⌨️ Step 2: Or type here")
 input_col, clear_col = st.columns([0.82, 0.18])
@@ -94,12 +107,12 @@ with clear_col:
     st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
     st.button("🗑️", on_click=on_clear_click)
 
-# --- 7. INPUT SELECTION LOGIC ---
+# --- 7. INPUT SELECTION ---
 final_input = ""
 
-# Check if we have new voice data
+# Prioritize voice if new bytes are detected
 if audio_info and audio_info.get('bytes'):
-    with st.spinner("🤖 Transcribing voice..."):
+    with st.spinner("🤖 Transcribing..."):
         try:
             response = st.session_state.ai_client.models.generate_content(
                 model='gemini-2.0-flash',
@@ -109,37 +122,43 @@ if audio_info and audio_info.get('bytes'):
                 ]
             )
             final_input = response.text.strip()
-            st.success(f"Recognized: {final_input}")
+            st.success(f"I heard: {final_input}")
         except Exception as e:
-            st.error(f"Voice Transcription failed. Try typing instead? Error: {e}")
+            st.error(f"Voice Error: {e}")
 elif manual_input:
     final_input = manual_input
 
-# --- 8. AI TRANSLATION LOGIC ---
+# --- 8. AI LOGIC (STRICT SIMPLIFICATION) ---
 if final_input and final_input != st.session_state.get("last_input"):
     with st.spinner("🤖 Thinking..."):
         try:
             st.session_state.last_input = final_input
             
-            # Translate User's Input
+            # Base Translation
             u_res = st.session_state.ai_client.models.generate_content(
                 model='gemini-2.0-flash', 
                 contents=f"Translate into natural {target_lang}: '{final_input}'"
             )
             st.session_state.user_translation = u_res.text
 
-            # Generate Robot Response
+            # Response Logic
             if mode == "Live Translation":
-                prompt = f"Translate '{final_input}' into {target_lang}. Provide formal, informal, and 3 replies. Format: 'Formal: [text]' etc."
+                # STRICT PROMPT: Re-enforces the simple list format
+                prompt = (f"Translate '{final_input}' into {target_lang}. "
+                          f"Provide exactly: 1 Formal version, 1 Informal version, and 3 short replies. "
+                          f"Format as: 'Formal: [text]', 'Informal: [text]', 'Reply 1: [text]', etc. "
+                          f"Each on a NEW line. No extra conversation.")
             else:
-                prompt = f"Reply as a friend in {target_lang} to: '{st.session_state.user_translation}'. Give 3 follow-ups with English meanings."
+                prompt = (f"Reply as a friend in {target_lang} to: '{st.session_state.user_translation}'. "
+                          f"Follow with 3 short practice options with English meanings. Keep it brief.")
 
             r_res = st.session_state.ai_client.models.generate_content(
                 model='gemini-2.0-flash', contents=prompt
             )
             st.session_state.current_translation = r_res.text
+            
         except Exception as e:
-            st.error(f"AI Translation Error: {e}")
+            st.error(f"AI Error: {e}")
 
 # --- 9. DISPLAY ---
 if st.session_state.get("user_translation"):
