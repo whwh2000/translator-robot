@@ -3,6 +3,7 @@ from google import genai
 from gtts import gTTS
 import io
 import re
+import base64
 
 # --- 1. SETUP & SESSION STATE ---
 API_KEY = st.secrets.get("GOOGLE_API_KEY")
@@ -24,55 +25,52 @@ LANG_MAP = {
     "Ukrainian": "uk"
 }
 
-# --- 3. DYNAMIC RESET LOGIC ---
+# Track language to clear app on change
 if "prev_lang" not in st.session_state:
     st.session_state.prev_lang = "Korean"
 
-# --- 4. AUDIO HELPER (Mobile Optimized) ---
-def get_audio(text, lang_name):
+# --- 3. AUDIO HELPER (Mobile Base64 Injection) ---
+def get_audio_html(text, lang_name):
     lang_code = LANG_MAP.get(lang_name, "en")
     
-    # Remove phonetic guides in brackets
+    # 1. Clean phonetic guides and headers
     clean_text = re.sub(r'\(.*?\)', '', text)
-    
-    # List of labels to strip from the audio voice
-    patterns_to_remove = [
-        r'^Formal\s*:\s*', 
-        r'^Informal\s*:\s*', 
-        r'^Reply\s*\d+\s*:\s*', 
-        r'^Translation\s*:\s*',
-        r'^\d+\.\s*'
+    patterns = [
+        r'^Formal\s*:\s*', r'^Informal\s*:\s*', 
+        r'^Reply\s*\d+\s*:\s*', r'^Translation\s*:\s*', r'^\d+\.\s*'
     ]
-    
-    for pattern in patterns_to_remove:
-        clean_text = re.sub(pattern, '', clean_text, flags=re.IGNORECASE)
+    for p in patterns:
+        clean_text = re.sub(p, '', clean_text, flags=re.IGNORECASE)
 
-    # For non-latin scripts, keep only those characters
+    # 2. Script filtering for Non-Latin languages
     if lang_name in ["Korean", "Japanese", "Russian", "Ukrainian"]:
-        target_chars = re.findall(r'[\u3040-\u30FF\u4E00-\u9FAF\uAC00-\uD7AF\u0400-\u04FF0-9?.!, ]+', clean_text)
-        clean_text = "".join(target_chars)
+        chars = re.findall(r'[\u3040-\u30FF\u4E00-\u9FAF\uAC00-\uD7AF\u0400-\u04FF0-9?.!, ]+', clean_text)
+        clean_text = "".join(chars)
     
     clean_text = clean_text.strip()
-    
     if not clean_text:
         return None
 
     try:
-        # Generate Audio
+        # Generate speech
         tts = gTTS(text=clean_text, lang=lang_code)
-        audio_fp = io.BytesIO()
-        tts.write_to_fp(audio_fp)
-        audio_fp.seek(0) # Move to the start of the file
-        return audio_fp.read()
+        fp = io.BytesIO()
+        tts.write_to_fp(fp)
+        fp.seek(0)
+        
+        # Convert to Base64 string for mobile browser stability
+        b64 = base64.b64encode(fp.read()).decode()
+        # Return HTML5 audio tag string
+        return f'<audio controls src="data:audio/mp3;base64,{b64}" style="width: 100%; height: 30px;"></audio>'
     except Exception as e:
-        st.error(f"Audio Error: {e}")
-        return None
+        return f"<span>Audio Error: {e}</span>"
 
-# --- 5. SIDEBAR ---
+# --- 4. SIDEBAR ---
 with st.sidebar:
     st.header("Robot Settings")
     target_lang = st.selectbox("Pick a Language:", list(LANG_MAP.keys()))
     
+    # Reset app if language changes
     if target_lang != st.session_state.prev_lang:
         st.session_state.prev_lang = target_lang
         for key in ["current_translation", "user_translation", "last_input"]:
@@ -84,29 +82,29 @@ with st.sidebar:
 
     mode = st.radio("Choose Mode:", ["Live Translation", "Practice Chat"])
     st.divider()
-    if st.button("Clear History Manually"):
+    if st.button("Clear History"):
         st.session_state.clear()
         st.rerun()
 
-# --- 6. MAIN INTERFACE ---
+# --- 5. MAIN INTERFACE ---
 st.title(f"🤖 Magic {target_lang} Robot")
 
-user_input = st.text_input("Type in English and press Enter:", key="main_input_field")
+user_input = st.text_input("Type in English:", key="main_input_field")
 
 if user_input and user_input != st.session_state.get("last_input"):
-    with st.spinner("🤖 Thinking..."):
+    with st.spinner("Thinking..."):
         try:
             st.session_state.last_input = user_input
             
-            # Step A: User translation
-            user_trans_res = st.session_state.ai_client.models.generate_content(
+            # Translate User Input
+            u_res = st.session_state.ai_client.models.generate_content(
                 model='gemini-2.0-flash', 
                 contents=f"Translate into natural {target_lang}: '{user_input}'",
                 config={'temperature': 0.0}
             )
-            st.session_state.user_translation = user_trans_res.text
+            st.session_state.user_translation = u_res.text
 
-            # Step B: Robot response
+            # Generate Robot Response
             if mode == "Live Translation":
                 prompt = (f"Translate '{user_input}' into {target_lang}. Provide formal, "
                           f"informal, and 3 replies. Each on a NEW line. Format as 'Formal: [text]' etc.")
@@ -114,22 +112,21 @@ if user_input and user_input != st.session_state.get("last_input"):
                 prompt = (f"Reply as a friend in {target_lang} to: '{st.session_state.user_translation}'. "
                           f"Then give 3 follow-up options in {target_lang} with English meanings.")
 
-            robot_res = st.session_state.ai_client.models.generate_content(
+            r_res = st.session_state.ai_client.models.generate_content(
                 model='gemini-2.0-flash', contents=prompt, config={'temperature': 0.0}
             )
-            st.session_state.current_translation = robot_res.text
+            st.session_state.current_translation = r_res.text
             
         except Exception as e:
-            st.error(f"Robot Error: {e}")
+            st.error(f"AI Error: {e}")
 
-# --- 7. DISPLAY ---
+# --- 6. DISPLAY ---
 if "user_translation" in st.session_state and mode == "Practice Chat":
     if user_input == st.session_state.get("last_input"):
-        st.info(f"**You said in {target_lang}:**\n\n{st.session_state.user_translation}")
-        if st.button(f"🔊 Hear your {target_lang}", key="user_audio_btn"):
-            audio_data = get_audio(st.session_state.user_translation, target_lang)
-            if audio_data:
-                st.audio(audio_data, format="audio/mp3")
+        st.info(f"**You said:**\n\n{st.session_state.user_translation}")
+        audio_html = get_audio_html(st.session_state.user_translation, target_lang)
+        if audio_html:
+            st.markdown(audio_html, unsafe_allow_html=True)
         st.divider()
 
 if "current_translation" in st.session_state:
@@ -140,12 +137,12 @@ if "current_translation" in st.session_state:
         for i, line in enumerate(lines):
             clean_line = line.strip()
             if clean_line:
-                col1, col2 = st.columns([0.85, 0.15])
+                # Layout for text and audio button
+                col1, col2 = st.columns([0.8, 0.2])
                 with col1:
                     st.write(clean_line)
                 with col2:
-                    if st.button("🔊", key=f"audio_btn_{i}"):
-                        audio_data = get_audio(clean_line, target_lang)
-                        if audio_data:
-                            # We show the player. On mobile, this is more reliable than autoplay.
-                            st.audio(audio_data, format="audio/mp3")
+                    if st.button("🔊", key=f"btn_{i}"):
+                        audio_player = get_audio_html(clean_line, target_lang)
+                        if audio_player:
+                            st.markdown(audio_player, unsafe_allow_html=True)
