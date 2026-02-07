@@ -25,16 +25,17 @@ LANG_MAP = {
     "Ukrainian": "uk"
 }
 
-# Track language to clear app on change
 if "prev_lang" not in st.session_state:
     st.session_state.prev_lang = "Korean"
 
-# --- 3. AUDIO HELPER (Mobile Base64 Injection) ---
+# --- 3. AUDIO HELPER (Maintains Base64 & Header Scrubbing) ---
 def get_audio_html(text, lang_name):
     lang_code = LANG_MAP.get(lang_name, "en")
     
-    # 1. Clean phonetic guides and headers
+    # Scrub phonetic guides in brackets
     clean_text = re.sub(r'\(.*?\)', '', text)
+    
+    # Scrub headers so they aren't spoken
     patterns = [
         r'^Formal\s*:\s*', r'^Informal\s*:\s*', 
         r'^Reply\s*\d+\s*:\s*', r'^Translation\s*:\s*', r'^\d+\.\s*'
@@ -42,7 +43,7 @@ def get_audio_html(text, lang_name):
     for p in patterns:
         clean_text = re.sub(p, '', clean_text, flags=re.IGNORECASE)
 
-    # 2. Script filtering for Non-Latin languages
+    # Keep only target script for non-Latin languages
     if lang_name in ["Korean", "Japanese", "Russian", "Ukrainian"]:
         chars = re.findall(r'[\u3040-\u30FF\u4E00-\u9FAF\uAC00-\uD7AF\u0400-\u04FF0-9?.!, ]+', clean_text)
         clean_text = "".join(chars)
@@ -52,32 +53,34 @@ def get_audio_html(text, lang_name):
         return None
 
     try:
-        # Generate speech
         tts = gTTS(text=clean_text, lang=lang_code)
         fp = io.BytesIO()
         tts.write_to_fp(fp)
         fp.seek(0)
         
-        # Convert to Base64 string for mobile browser stability
+        # Base64 encoding for mobile stability
         b64 = base64.b64encode(fp.read()).decode()
-        # Return HTML5 audio tag string
-        return f'<audio controls src="data:audio/mp3;base64,{b64}" style="width: 100%; height: 30px;"></audio>'
-    except Exception as e:
-        return f"<span>Audio Error: {e}</span>"
+        return f'<audio controls src="data:audio/mp3;base64,{b64}" style="width: 100%; height: 35px;"></audio>'
+    except Exception:
+        return None
 
-# --- 4. SIDEBAR ---
+# --- 4. GLOBAL RESET FUNCTION ---
+def clear_app_state():
+    for key in ["current_translation", "user_translation", "last_input"]:
+        if key in st.session_state:
+            del st.session_state[key]
+    # Clear the text box by resetting the key
+    st.session_state.main_input_field = ""
+
+# --- 5. SIDEBAR ---
 with st.sidebar:
     st.header("Robot Settings")
     target_lang = st.selectbox("Pick a Language:", list(LANG_MAP.keys()))
     
-    # Reset app if language changes
+    # Auto-clear if language is swapped
     if target_lang != st.session_state.prev_lang:
         st.session_state.prev_lang = target_lang
-        for key in ["current_translation", "user_translation", "last_input"]:
-            if key in st.session_state:
-                del st.session_state[key]
-        if "main_input_field" in st.session_state:
-            st.session_state.main_input_field = ""
+        clear_app_state()
         st.rerun()
 
     mode = st.radio("Choose Mode:", ["Live Translation", "Practice Chat"])
@@ -86,17 +89,28 @@ with st.sidebar:
         st.session_state.clear()
         st.rerun()
 
-# --- 5. MAIN INTERFACE ---
+# --- 6. MAIN INTERFACE ---
 st.title(f"🤖 Magic {target_lang} Robot")
 
-user_input = st.text_input("Type in English:", key="main_input_field")
+# Input layout with clear button
+input_col, clear_col = st.columns([0.82, 0.18])
+
+with input_col:
+    user_input = st.text_input("Type in English:", key="main_input_field", placeholder="Ask the robot...")
+
+with clear_col:
+    # Adding vertical space to align button with text box
+    st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
+    if st.button("🗑️", help="Clear Text Box"):
+        clear_app_state()
+        st.rerun()
 
 if user_input and user_input != st.session_state.get("last_input"):
-    with st.spinner("Thinking..."):
+    with st.spinner("🤖 Thinking..."):
         try:
             st.session_state.last_input = user_input
             
-            # Translate User Input
+            # User Input Translation
             u_res = st.session_state.ai_client.models.generate_content(
                 model='gemini-2.0-flash', 
                 contents=f"Translate into natural {target_lang}: '{user_input}'",
@@ -104,7 +118,7 @@ if user_input and user_input != st.session_state.get("last_input"):
             )
             st.session_state.user_translation = u_res.text
 
-            # Generate Robot Response
+            # Robot Response Logic
             if mode == "Live Translation":
                 prompt = (f"Translate '{user_input}' into {target_lang}. Provide formal, "
                           f"informal, and 3 replies. Each on a NEW line. Format as 'Formal: [text]' etc.")
@@ -120,13 +134,13 @@ if user_input and user_input != st.session_state.get("last_input"):
         except Exception as e:
             st.error(f"AI Error: {e}")
 
-# --- 6. DISPLAY ---
+# --- 7. DISPLAY ---
 if "user_translation" in st.session_state and mode == "Practice Chat":
     if user_input == st.session_state.get("last_input"):
-        st.info(f"**You said:**\n\n{st.session_state.user_translation}")
-        audio_html = get_audio_html(st.session_state.user_translation, target_lang)
-        if audio_html:
-            st.markdown(audio_html, unsafe_allow_html=True)
+        st.info(f"**You said in {target_lang}:**\n\n{st.session_state.user_translation}")
+        u_audio = get_audio_html(st.session_state.user_translation, target_lang)
+        if u_audio:
+            st.markdown(u_audio, unsafe_allow_html=True)
         st.divider()
 
 if "current_translation" in st.session_state:
@@ -137,12 +151,11 @@ if "current_translation" in st.session_state:
         for i, line in enumerate(lines):
             clean_line = line.strip()
             if clean_line:
-                # Layout for text and audio button
                 col1, col2 = st.columns([0.8, 0.2])
                 with col1:
                     st.write(clean_line)
                 with col2:
                     if st.button("🔊", key=f"btn_{i}"):
-                        audio_player = get_audio_html(clean_line, target_lang)
-                        if audio_player:
-                            st.markdown(audio_player, unsafe_allow_html=True)
+                        audio_html = get_audio_html(clean_line, target_lang)
+                        if audio_html:
+                            st.markdown(audio_html, unsafe_allow_html=True)
